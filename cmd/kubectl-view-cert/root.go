@@ -1,5 +1,6 @@
 package main
 
+// nolint depguard
 import (
 	"context"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"gopkg.in/yaml.v2"
 
 	"github.com/lmolas/kubectl-view-cert/internal/parse"
 
@@ -27,6 +29,7 @@ const (
 	expiredFlag            = "expired"
 	showCaCertFlag         = "show-ca"
 	expiredDaysFromNowFlag = "expired-days-from-now"
+	yamlOutput             = "yaml"
 )
 
 type parsedFlags struct {
@@ -34,6 +37,7 @@ type parsedFlags struct {
 	expired       bool
 	showCaCert    bool
 	expiredInDays int
+	yamlOutput    bool
 	secretName    string
 	secretKey     string
 }
@@ -99,6 +103,7 @@ func init() {
 	rootCmd.Flags().BoolP(expiredFlag, "E", false, "Show only expired certificates")
 	rootCmd.Flags().BoolP(showCaCertFlag, "S", false, "Show CA certificates")
 	rootCmd.Flags().IntP(expiredDaysFromNowFlag, "D", 0, "Show expired certificates at date in future (now plus number of days)")
+	rootCmd.Flags().BoolP(yamlOutput, "Y", false, "YAML output")
 
 	cf.AddFlags(rootCmd.Flags())
 	if err := flag.Set("logtostderr", "true"); err != nil {
@@ -147,6 +152,11 @@ func parseFlagsAndArguments(command *cobra.Command, args []string) parsedFlags {
 		expiredInDays = 0
 	}
 
+	yamlOutput, err := command.Flags().GetBool(yamlOutput)
+	if err != nil {
+		yamlOutput = false
+	}
+
 	var secretName, secretKey string
 	if len(args) > 0 {
 		secretName = args[0]
@@ -156,7 +166,7 @@ func parseFlagsAndArguments(command *cobra.Command, args []string) parsedFlags {
 		secretKey = args[1]
 	}
 
-	return parsedFlags{allNs, expired, showCaCert, expiredInDays, secretName, secretKey}
+	return parsedFlags{allNs, expired, showCaCert, expiredInDays, yamlOutput, secretName, secretKey}
 }
 
 // nolint gocognit // Better readability in one block
@@ -182,7 +192,7 @@ func run(command *cobra.Command, args []string) error {
 	}
 
 	if parsedFlags.secretName != "" {
-		datas, secretKeys, err := getData(ctx, parsedFlags.secretName, ns, parsedFlags.secretKey, ri)
+		datas, secretKeys, err := getData(ctx, parsedFlags.secretName, ns, parsedFlags.secretKey, ri, parsedFlags.showCaCert)
 		if err != nil {
 			return err
 		}
@@ -194,13 +204,13 @@ func run(command *cobra.Command, args []string) error {
 			}
 		} else {
 			// Display
-			err = displayDatas(datas)
+			err = displayDatas(datas, parsedFlags.yamlOutput)
 			if err != nil {
 				return err
 			}
 		}
 	} else {
-		datas, err := getDatas(ctx, ri)
+		datas, err := getDatas(ctx, ri, parsedFlags.showCaCert)
 		if err != nil {
 			return err
 		}
@@ -219,7 +229,7 @@ func run(command *cobra.Command, args []string) error {
 		}
 
 		// Display
-		err = displayDatas(filteredDatas)
+		err = displayDatas(filteredDatas, parsedFlags.yamlOutput)
 		if err != nil {
 			return err
 		}
@@ -228,25 +238,42 @@ func run(command *cobra.Command, args []string) error {
 	return nil
 }
 
-func getDatas(ctx context.Context, ri dynamic.ResourceInterface) ([]*Certificate, error) {
+func getDatas(ctx context.Context, ri dynamic.ResourceInterface, showCa bool) ([]*Certificate, error) {
 	datas := make([]*Certificate, 0)
 
 	tlsSecrets, err := ri.List(ctx, v1.ListOptions{FieldSelector: "type=kubernetes.io/tls"})
 	if err != nil {
-		return datas, fmt.Errorf("failed to get secrets: %w", err)
+		return datas, fmt.Errorf("failed to get 'kubernetes.io/tls' secrets: %w", err)
 	}
+	OpaqueSecrets, errOpaque := ri.List(ctx, v1.ListOptions{FieldSelector: "type=Opaque"})
+	if errOpaque != nil {
+		return datas, fmt.Errorf("failed to get 'Opaque' secrets: %w", err)
+	}
+	secrets := tlsSecrets.Items
+	secrets = append(secrets, OpaqueSecrets.Items...)
 
-	for _, tlsSecret := range tlsSecrets.Items {
-		certData, caCertData, _, err := parseData(tlsSecret.GetNamespace(), tlsSecret.GetName(), tlsSecret.Object, "", false)
-		if err != nil {
-			return datas, err
+	var isReplicated bool
+	for _, secret := range secrets {
+		isReplicated = false
+		certData, caCertData, _ := parseData(secret.GetNamespace(), secret.GetName(), secret.Object, "", false, showCa)
+		for annotationName := range secret.GetAnnotations() {
+			if annotationName == "replicator.v1.mittwald.de/replicated-at" {
+				isReplicated = true
+                               // nolint gomnd
+				klog.V(2).Infoln("msg", "skipping secret replicated from another namespace '"+secret.GetNamespace()+"/"+secret.GetName()+"'")
+			}
+			continue
 		}
-
+		if isReplicated {
+			continue
+		}
 		if certData != nil {
+			klog.V(1).Infoln("msg", "adding certificate '"+certData.Subject+"'", "secret", "'"+secret.GetNamespace()+"/"+secret.GetName()+"'")
 			datas = append(datas, certData)
 		}
 
 		if caCertData != nil {
+			klog.V(1).Infoln("msg", "adding CA certificate '"+caCertData.Subject+"'", "secret", "'"+secret.GetNamespace()+"/"+secret.GetName()+"'")
 			datas = append(datas, caCertData)
 		}
 	}
@@ -254,27 +281,24 @@ func getDatas(ctx context.Context, ri dynamic.ResourceInterface) ([]*Certificate
 	return datas, nil
 }
 
-func getData(ctx context.Context, secretName, ns, secretKey string, ri dynamic.ResourceInterface) ([]*Certificate, *[]string, error) {
+func getData(ctx context.Context, secretName, ns, secretKey string, ri dynamic.ResourceInterface, showCA bool) ([]*Certificate, *[]string, error) {
 	datas := make([]*Certificate, 0)
 
 	secret, err := ri.Get(ctx, secretName, v1.GetOptions{})
 	if err != nil {
-		return datas, nil, fmt.Errorf("failed to get secret with name %s: %w", secretName, err)
+		return datas, nil, fmt.Errorf("failed to get secret '%s/%s': %w", ns, secretName, err)
 	}
 
-	certData, caCertData, secretKeys, err := parseData(ns, secretName, secret.Object, secretKey, true)
-	if err != nil {
-		return datas, nil, err
+	certData, caCertData, secretKeys := parseData(ns, secretName, secret.Object, secretKey, true, showCA)
+	if certData == nil {
+		return datas, nil, fmt.Errorf("failed to get secret '%s/%s'", ns, secretName)
 	}
 
 	if secretKeys != nil {
 		return datas, secretKeys, nil
 	}
 
-	if certData != nil {
-		datas = append(datas, certData)
-	}
-
+	datas = append(datas, certData)
 	if caCertData != nil {
 		datas = append(datas, caCertData)
 	}
@@ -282,7 +306,11 @@ func getData(ctx context.Context, secretName, ns, secretKey string, ri dynamic.R
 	return datas, nil, nil
 }
 
-func displayDatas(datas []*Certificate) error {
+func displayDatas(datas []*Certificate, yamlOutput bool) error {
+	if yamlOutput {
+		encoder := yaml.NewEncoder(os.Stdout)
+		return encoder.Encode(&datas)
+	}
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "    ")
 	return encoder.Encode(&datas)
@@ -324,25 +352,35 @@ func getResourceInterface(allNs bool, secretName string) (string, dynamic.Resour
 	return ns, ri, nil
 }
 
-func parseData(ns, secretName string, data map[string]interface{}, secretKey string, listKeys bool) (certData, caCertData *Certificate, secretKeys *[]string, err error) {
-	secretCertData, err := parse.NewCertificateData(ns, secretName, data, secretKey, listKeys)
+func parseData(ns, secretName string, data map[string]interface{}, secretKey string, listKeys, showCA bool) (certData, caCertData *Certificate, secretKeys *[]string) {
+	secretCertData, secretKeysList, err := parse.NewCertificateData(ns, secretName, data, secretKey, listKeys, showCA)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to parse secret with name %s in namespace %s %v", secretName, ns, err)
+		klog.V(1).Infoln("msg", "failed to parse secret '"+ns+"/"+secretName+"'", "err", err)
+		return nil, nil, nil
+	}
+
+	if secretCertData == nil {
+		klog.V(1).Infoln("msg", "no 'data' key found in secret '"+ns+"/"+secretName+"'", "err", err)
+		return nil, nil, nil
 	}
 
 	if len(secretCertData.SecretKeys) > 0 {
-		return nil, nil, &secretCertData.SecretKeys, nil
+		klog.V(1).Infoln("msg", "return '"+ns+"/"+secretName+"'")
+		return nil, nil, &secretCertData.SecretKeys
 	}
 
 	parsedCerts, err := secretCertData.ParseCertificates()
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("unable to parse certificates for secret %s in namespace %s %v", secretName, ns, err)
+		klog.V(1).Infoln("msg", "unable to parse certificates for secret '"+ns+"/"+secretName+"'", "err", err)
+		return nil, nil, nil
 	}
 
 	if parsedCerts.Certificate != nil {
 		certData = &Certificate{
 			SecretName:   parsedCerts.SecretName,
 			Namespace:    parsedCerts.Namespace,
+			Type:         secretCertData.Type,
+			SecretKey:    secretKeysList[0],
 			IsCA:         parsedCerts.Certificate.IsCA,
 			Issuer:       parsedCerts.Certificate.Issuer.String(),
 			SerialNumber: fmt.Sprintf("%x", parsedCerts.Certificate.SerialNumber),
@@ -359,6 +397,8 @@ func parseData(ns, secretName string, data map[string]interface{}, secretKey str
 		caCertData = &Certificate{
 			SecretName:   parsedCerts.SecretName,
 			Namespace:    parsedCerts.Namespace,
+			SecretKey:    secretKeysList[1],
+			Type:         secretCertData.Type,
 			IsCA:         parsedCerts.CaCertificate.IsCA,
 			Issuer:       parsedCerts.CaCertificate.Issuer.String(),
 			SerialNumber: fmt.Sprintf("%x", parsedCerts.CaCertificate.SerialNumber),
@@ -371,5 +411,5 @@ func parseData(ns, secretName string, data map[string]interface{}, secretKey str
 		}
 	}
 
-	return certData, caCertData, nil, err
+	return certData, caCertData, nil
 }
